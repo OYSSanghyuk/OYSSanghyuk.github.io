@@ -10,301 +10,115 @@ github: "https://github.com/alainpham/quarkus-kafka-camel-servlet"
 ---
 
 <p>
-    When using Apache Camel with Quarkus as of today, we are limited to a number of Camel connectors. An important one, being
-    the Apache Kafka connector.
-    The Kafka connector provided through the Smallrye Kafka Extension is available for Quarkus though. So in this
-    article, I will show how to
-    wire the Smallrye Kafka connector and Camel together.
-    We will also be using the camel-servlet component to reuse the undertow http endpoint provided by Quarkus. To
-    spice things up a little we will use the XML DSL of Camel.
-    All of this will be natively compiled in the end.
+    Topic : Mesh, Spline, B-Spline, NURBS, Modeling, Rendering
 </p>
 <!--more-->
 
-<h2>Setup a project</h2>
+<h2>1. 3차원 객체의 모델링 표현의 3가지</h2>
 
-<p>In a previous article I showed how to create a hello world using Camel and Quarkus. Here We will try to do something
-    more advanced. Lets start by setting up the project</p>
-
-{% highlight shell %}
-
-mkdir quarkus-kafka-camel-servlet
-
-cd quarkus-kafka-camel-servlet
-
-mvn io.quarkus:quarkus-maven-plugin:0.18.0:create \
--DprojectGroupId=agilabs \
--DprojectArtifactId=quarkus-kafka-camel-servlet \
--DclassName="agilabs.GreetingResource" \
--Dpath="/hello"
-{% endhighlight %}
-
-<p>
-    Add the following dependencies to the pom.xml file.
-</p>
-{% highlight xml %}
-<dependency>
-    <groupId>io.quarkus</groupId>
-    <artifactId>quarkus-smallrye-reactive-messaging-kafka</artifactId>
-</dependency>
-<dependency>
-    <groupId>io.quarkus</groupId>
-    <artifactId>quarkus-camel-core</artifactId>
-</dependency>
-<dependency>
-    <groupId>io.quarkus</groupId>
-    <artifactId>quarkus-camel-servlet</artifactId>
-</dependency>
-{% endhighlight %}
-
-<h2>Configure Camel</h2>
-
-<h3>Application properties</h3>
-
-<p>Configure application properties in src/main/resources/application.properties</p>
-
-<pre>
-quarkus.camel.servlet.url-patterns = /camel/*
-%dev.quarkus.camel.routes-uris = camel/routes.xml
-quarkus.camel.routes-uris=file:/camel/routes.xml
-quarkus.camel.defer-init-phase = true
-</pre>
-
-<p>
-    We will match all calls that go to /camel/* to the camel servlet component. In dev mode we will scan the file
-    routes.xml for camel routes located in the classpath, in the resource folder camel.
-</p>
-<p>
-    When launched in "production mode" with the native executable the resources are not included by default in the
-    binary. I'm externalizing the routes.xml file to the folder /camel so that it can be set
-    and changed dynamically. This is actually quite interesting because we get to have a configurable native executable
-    that we can fine tune by switching the routes during run time.
-    For some when I tried to change the property quarkus.camel.routes-uris during native run time, it's new value doesn't
-    seem to be taken into account. So this file path is kind of like being hard coded right now.. 
-</p>
-<p><strong>Edit July 6,2019 : I discovered that there are different <a
-            href="https://quarkus.io/guides/extension-authors-guide" target="_blank">Configuration Phases</a> 
-            : BUILD_TIME, BUILD_AND_RUN_TIME_FIXED & RUN_TIME. 
-        It turns out this property is set to BUILD_AND_RUN_TIME_FIXED, so it is not dynamically read during native run time for the moment.
-        More details <a target="_blank" href="https://github.com/quarkusio/quarkus/issues/3116">here</a>.
-        </strong></p>
-<p>
-    Quarkus.camel.defer-init-phase property is set to true because it seems that the camel context is created before all
-    the CDI bean wiring and dependency injection happens.
-    I need to do further digging to understand entirely how this works.
-</p>
-
-<h3>
-    Camel Routes XML Files
-</h3>
-
-<p>
-    Lets set up the routes in the src/main/resources/camel/routes.xml file.
-</p>
-
-{% highlight xml %}
-<?xml version="1.0" encoding="UTF-8" ?>
-<routes xmlns="http://camel.apache.org/schema/spring" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-    xsi:schemaLocation="http://camel.apache.org/schema/spring http://camel.apache.org/schema/spring/camel-spring.xsd">
-
-    <route id="receive-kafka-events">
-        <from uri="direct:receive-events"></from>
-        <log message="Received from kafka broker : ${body}"></log>
-    </route>
-
-    <route id="send-kafka-events">
-        <from uri="servlet:send"></from>
-        <log message="Sending"></log>
-        <convertBodyTo type="java.lang.String"></convertBodyTo>
-        <bean ref="smallrye-producer" method="produce(${body})"></bean>
-        <setBody>
-            <constant>Message sent</constant>
-        </setBody>
-    </route>
-</routes>
-{% endhighlight %}
-
-<p>The first route is to consume messages coming from Kafka. We will wire later on a camel producer template to send
-    messages to this route from any other class in application</p>
-<p>The second route listens to http requests coming on the path <strong>http://0.0.0.0:8080/camel/send</strong>.
-    It will use a bean that incorporates an emitter to send messages.
-</p>
-
-<h2>Configure sinks for Kafka topics</h2>
-
-<h3>Application properties</h3>
-
-<pre>
-mp.messaging.incoming.in-events.connector=smallrye-kafka
-mp.messaging.incoming.in-events.topic=events
-mp.messaging.incoming.in-events.value.deserializer=org.apache.kafka.common.serialization.StringDeserializer
-
-mp.messaging.outgoing.out-events.connector=smallrye-kafka
-mp.messaging.outgoing.out-events.topic=events
-mp.messaging.outgoing.out-events.value.serializer=org.apache.kafka.common.serialization.StringSerializer
-</pre>
-
-<p>We will configure a smallrye-kafka connector for incoming messages and outgoing messages</p>
-
-<h3>Create a consumer</h3>
-
-<p>Now lets go ahead and create a consumer with the @Incoming annotation. We will need to inject a Camel
-    ProducerTemplate instance into the consumer so that the message can be forwarded to our Camel direct endpoint</p>
-
-{% highlight java %}
-package agilabs;
-import javax.enterprise.context.ApplicationScoped;
-import javax.inject.Inject;
-import org.apache.camel.ProducerTemplate;
-import org.eclipse.microprofile.reactive.messaging.Incoming;
-
-@ApplicationScoped
-public class Consumer {
+<h4>다각형 메쉬 </h4>
+<p>여러가지 크기와 모양의 다각형들이 그물 모양으로 연결 된 것을 말하며,</p>
+<p>삼각형을 이용한 삼각형 메쉬법, 사각형을 이용한 사각 메쉬법이 있다. </p>
+<p>특히 삼각형은 가장 간단한 다각형이기 때문에 가장 많이 사용된다.</p>
     
-    @Inject
-    ProducerTemplate camelProducer;
-
-    @Incoming("in-events")
-    public void consume(String message) {              
-        camelProducer.sendBody("direct:receive-events", message);
-    }
-}
-{% endhighlight %}
-
-<h3>Create a producer</h3>
-
-<p>
-    Now lets create a producer. Note that this producer will be used by the camel xml context. So it needs to support reflection to find the different methods dynamically.
-    We need to register this class for reflection so that it can work once compiled to native code.
-</p>
-
-{% highlight java %}
-package agilabs;
-
-import javax.enterprise.context.ApplicationScoped;
-import javax.inject.Inject;
-
-import org.apache.camel.ProducerTemplate;
-import org.eclipse.microprofile.reactive.messaging.Incoming;
-
-import io.quarkus.runtime.annotations.RegisterForReflection;
-import io.smallrye.reactive.messaging.annotations.Emitter;
-import io.smallrye.reactive.messaging.annotations.Stream;
-
-@ApplicationScoped
-@RegisterForReflection
-public class Producer {
+<h4>기하적 데이터 표</h4>
+<p>다면체의 기하적 정보를 나타내는 기하적 데이터 표는 꼭지점,면,모서리들에 관한 데이터를 포함한 표로</p>
+<p>기하적 데이터의 표의 데이터들간에 항상 일관성과 완전성이 유지된다.</p>
     
-    @Inject
-    @Stream("out-events")
-    Emitter<String> emitter;
+<h4>평면방정식</h4>
+<p>다면체는 다각형면들로 구성되어 있고 각 다각형은 공간상의 평면상에 위치한다.</p>
+<p>즉 3차원 공간에서 평면에 관한 기하학을 3차원 그래픽스에 적용할 수 있다.</p>
+<p>평면의 방정식은 다음과 같다.</p>
 
-    public void produce(String message) {
-        emitter.send(message);       
-    }
-}
-{% endhighlight %}
 
-<h2>Wiring it all together</h2>
+<h2>2. 스플라인곡선 속성과 3차원 스플라인 곡선</h2>
 
-<p>Now that we have everything configured. We need to wire everything together. Register the SmallRye producer into the
-    camel context and inject a camel producer template in the Quarkus CDI context.</p>
-<p>As mentioned earlier, it seems that the Camel context is started earlier than the CDI context, so when Camel
-    tries to look for a bean called smallrye-producer it will fail to start because it can't find it.
-    This also comes from the fact that ApplicationScoped beans are instantiated in a lazy fashion. 
-    Since the smallrye-producer is never called in the CDI context, it will never be initialized.
-    For these reasons we need to observe the Camel InitializedEvent and register the SmallRye producer at that specific time.
-</p>
-<p>
-    The @Produces annotation provides the Camel producer template to the CDI context.
-</p>
+<h4>스플라인 곡선의 속성</h4>
+<p>보통 2차원 객체는 부드러운 곡선으로 이루어져 있으며 이 계산을 표현한 다항식을 스플라인이라고 한다.</p>
+<p>스플라인 곡선은 주어진 일련의 제어점에 의해 곡선의 형태가 결정되는 부드러운 곡선이다.</p>
+    
+<h4>3차원 스플라인 곡선</h4>
+<p>변수 x,y,z 가 매개변수 u의 3차원식으로 표현되는 스플라인 곡선을 3차원 스플라인 곡선이라고 하며</p>
+<p>그래픽 객체를 설계할 때 자주 이용된다.</p>
 
-{% highlight java %}
-package agilabs;
-import javax.enterprise.event.Observes;
-import javax.enterprise.inject.Produces;
-import javax.inject.Inject;
-import org.apache.camel.CamelContext;
-import org.apache.camel.ProducerTemplate;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import io.quarkus.camel.core.runtime.InitializedEvent;
-import io.smallrye.reactive.messaging.annotations.Emitter;
-import io.smallrye.reactive.messaging.annotations.Stream;
+<h2>3. 베지어 곡선과 베지어 곡면</h2>
 
-public class CamelWiring{
+<h4>베지어 곡선</h4>
+    
+<p>베지어 곡선은 주어진 제어점들의 위치에 따라 이 제어점들을 근사하는 곡선을 생성시키는 근사곡선 기법이다.</p>
+<p>베지어 곡선은 다항식으로 표현되며 제어점의 수는 베지어 다항식의 차수를 결정한다.</p>
+<p>즉, 제어점의 수에 의해 배합함수의 차수가 결정되므로 제어점의 수가 많아지면 계산량이 늘어난다.</p>
+    
+<h4>베지어 곡면</h4>
+<p>베지어 곡선들이 공간상에서 서로 교차하도록 구성하면 제어점들을 근사하는 하나의 곡면이 생성된다.</p>
+<p>이 곡면을 이용하면 매우 부드러운 곡면을 만들수 있으며 실시간에 원하는 곡면의 모양을 만들 수 있다.</p>
 
-    @Inject
-    Producer smallRyeProducer;
+<h2>4. B스플라인 곡선과 곡면 | NURBS 곡선과 곡면</h2>
 
-    @Inject
-    CamelContext camelContext;
+<h4>B-스플라인 곡선 및 곡면</h4>
+<p>임의의 곡선을 설계하는 데 사용되며 국부제어가 가능한 곡선이다.</p>
+<p>제어점의 개수에 의해 차수가 결정되는 베지어 곡선과 달리 제어점의 수가 독립적이며</p> 
+<p>배합함수의 차수와 적용구간을 곡선 설계자가 결정한다.</p>
+    
+<h4>NURBS 곡선과 곡면</h4>
+<p>B-스플라인의 개념을 확장한 것으로 매듭벡터가 비균일한 B-스플라인 곡선으로 볼 수 있다.</p>
+<p>원근투영에 대하여 변하지 않는 성질이 있으며 원뿔곡선도 생성할 수 있다.</p>
 
-    public void registerSmallryeEmitter( @Observes InitializedEvent ev ) throws Exception {
-        camelContext.getRegistry().bind("smallrye-producer", smallRyeProducer);
-    }
+<h2>5. 베지어곡선/곡면과 B-스플라인곡선/곡면과 NURBS 곡선/곡면을 비교</h2>
 
-    @Produces
-    public ProducerTemplate buildCamelProducerTemplate() throws Exception {
-        return camelContext.createProducerTemplate(); ;
-    }
-}
-{% endhighlight %}
+<h4>모델링 곡선/곡면의 성질 비교</h4>
 
-<h2>Compiling and testing the project</h2>
 
-<p>Now lets compile it to native code. The compilation is quite memory & CPU intensive. I guess this is due to the costly compilation of XML support libraries. 
-    At peak I observed 9.8 GB of memory consumption. The whole compilation process took about 7 to 8 minutes</p>
+<h2>6. 스위핑과 솔리드 모델링</h2>
 
-<pre>
-git clone https://github.com/alainpham/quarkus-kafka-camel-servlet.git
-cd quarkus-kafka-camel-servlet
-mvn package -Pnative
-</pre>
+<h4>스위핑</h4>
+<p>3차원 공간에서 원이나 다각형과 같은 평면도형을 지정된 경로를 따라 이동시키거나 </p>
+<p>하나의 축을 중심으로 회전 시키면 새로운 3차원 객체가 생성되는데 이를 스위핑이라 한다.</p>
 
-<p>
-    If you are in a rush. I have already built a container image for you. You can run everything wih only one command
-    using the docker-compose.yml file. It will boot a zookeeper and a kafka broker using images provided by the Strimzi project and 
-    also a container with the current project.
-</p>
+<h4>솔리드 모델링</h4>
+<p>솔리드 모델링 기법은 CSG 방식이라고도 불리며 사면체,육면체,구,원기둥,원뿔 등과 같은 3차원 기본객체들에</p>
+<p>집합연산등을 적용함으로써 새로운 객체를 만드는 방법이다. </p>
 
-<pre>
-docker-compose up
-</pre>
 
-<p>You can also get the container image directly here :
-<br>
-        <a href="https://hub.docker.com/r/alainpham/quarkus-kafka-camel-servlet">https://hub.docker.com/r/alainpham/quarkus-kafka-camel-servlet</a>
-</p>
 
-<p>Test it!</p>
-<pre>
-curl http://localhost:8080/camel/send  -X POST -H "Content-Type: text/plain"  -d 'Hello there!!'
-</pre>
 
-<p>The output should be</p>
+<h2>7. 은면제거 알고리즘과 기법 4가지</h2>
 
-<pre>
-quarkus-kafka-camel-servlet_1  | 2019-07-05 13:12:58,025 INFO  [send-kafka-events] (executor-thread-1) Sending
-quarkus-kafka-camel-servlet_1  | 2019-07-05 13:12:58,027 INFO  [io.sma.rea.mes.kaf.KafkaSink] (vert.x-eventloop-thread-1) Message org.eclipse.microprofile.reactive.messaging.Message$$Lambda$5e1799c60041209b57937765b33186671a72f6f8@7f35f7425e98 sent successfully to Kafka topic 'events'
-quarkus-kafka-camel-servlet_1  | 2019-07-05 13:12:58,027 INFO  [receive-kafka-events] (vert.x-eventloop-thread-0) Received from kafka broker : Hello there!
-</pre>
+<h4>은면제거</h4>
+<p>시점에서 앞에 있는 객체나 가려진 면들을 제거하는 과정을 의미한다.</p>
+<p>이를 통해 현실감 있는 화면과 랜더링 시간을 줄일 수 있다.</p>
+
+<h4>은면제거에서 가장 많이 이용하는 원리</h4> 
+<p>1. 은면처리할 객체나 객체를 구성하는 면들을 정해진 원칙에 따라 정렬하는 것</p>
+<p>2. 객체의 공간적 시간적 밀착성을 이용하는 것</p>
+<p>3. 객체 포함영역을 도입함으로써 깊이, 수평방향, 수직방향 으로 겹치는지 용이여부를 판단</p>
+
+<h4>은면제거알고리즘 기법</h4>
+
+<p>은면제거 기법은 크게 객체공간법과 이미지 공간법으로 구분되며</p>
+
+<p>객체공간법은 은선제거 알고리즘, 깊이정렬 알고리즘이 있으며</p>
+<p>이미지 공간법은 Z-버퍼 알고리즘과 레이캐스팅 기법이 있다.</p>
+
+<p>은선제거 : 선과 면간에 보이지 않는 선의 부분을 제거하는 기법</p>
+<p>깊이정렬 : 폴리곤의 각 면을 깊이에 따라 정렬한뒤 먼것 부터 투영하고 그리는 기법</p>
+<p>Z-버퍼 : 물체의 가시성을 화소 단위로 조사하여 깊이(z) 값이 가장 작은 평면의 값을 그린다.</p>
+<p>레이캐스팅 : 시점에서 투영면의 각 화소를 통해 빛을 투사하고, 이 빛과 처음으로 만나는 객체를 선택하여</p>
+<p>해당 픽셀을 그린다.</p>
+
+<h2>8. 곡면의 렌더링과정 5가지</h2>
+
+<h4>곡면렌더링의 과정</h4>
+<p>렌더링은 3차원 모델링기법을 이용하여 만들어진 객체들에 다음과 같은 과정을 거치게 합니다.</p>
+
+<p>1. 은면제거 : 관찰자로부터 보이지 않는 면들을 제거하는 것을 의미</p>
+
+<p>2. 셰이딩 : 다각형면에서 각 점의 위치에서 관찰자의 눈에 들어오는 빛의 반사량과 성분을 계산하는 과정</p>
+
+<p>3. 투명한 물체 거리 : 실감있는 결과를 위해 앞에 위치한 물체의 투명도에 따른 빛의 투과량을 계산 후 반영</p>
+
+<p>4. 텍스쳐 매핑 : 이미지나 사진을 3차원 물체의 표면에 입히는 과정</p>
+
+<p>5. 그림자 생성 : 물체와 형태와 색상을 눈으로 인지할 수 있다는 것은 그림자의 생성원인인 광원이 존재한다는 것</p>
 
 <p>Thanks for reading !</p>
-
-
-<p><strong>Resources I used for inspiration</strong></p>
-<ul>
-    <li>
-        <a href="https://quarkus.io/guides/kafka-guide">Quarkus Kafka Guide</a>
-    </li>
-    <li>
-        <a href="https://quarkus.io/guides/cdi-reference">Quarkus - Contexts and Dependency Injection</a>
-    </li>
-    <li>
-        <a href="https://github.com/gnodet/quarkus-camel">Quarkus - Camel example by Guillaume Nodet</a>
-    </li>
-    <li><a
-            href="https://github.com/quarkusio/quarkus/blob/master/extensions/smallrye-reactive-messaging/deployment/src/test/java/io/quarkus/smallrye/reactivemessaging/StreamEmitter.java">Smallrye
-            Reactive Messaging Unit Test</a></li>
-</ul>
